@@ -5,7 +5,7 @@ from dotenv import dotenv_values
 from nacl.signing import SigningKey
 from pyarrow.ipc import RecordBatchStreamReader
 import base64
-from biscuit_auth import Authorizer, Biscuit, BiscuitBuilder, BlockBuilder, KeyPair, PrivateKey, PublicKey, Rule
+from biscuit_auth import BiscuitBuilder, KeyPair, PrivateKey, PublicKey, Rule
 import random
 import string
 import time
@@ -27,9 +27,13 @@ def main():
 
 def create_tamperproof_table(biscuit, access_token):
     # https://docs.spaceandtime.io/reference/configure-resources-ddl
+    # Note that we use the same DDL endpoint for creating tamper proof tables as we do for regular tables
+
     url = conf['api_url'] + "sql/ddl"
 
-    sqlText = f"CREATE TABLE {biscuit['resource_id']} (ID BIGINT, PROOF_ORDER BIGINT, PLANET VARCHAR, PRIMARY KEY(ID)) WITH \"public_key={biscuit['public_key']},access_type=public_read,tamperproof=true,immutable=true,persist_interval=10\""
+    sqlText = f"CREATE TABLE {biscuit['resource_id']} (PROOF_ORDER BIGINT PRIMARY KEY, PLANET VARCHAR) WITH \
+        \"public_key={biscuit['public_key']},access_type=public_read,tamperproof=true,immutable=true,persist_interval=10\""
+    
     # needed for prod env    
     biscuit_token = [biscuit['token']]
 
@@ -42,16 +46,17 @@ def create_tamperproof_table(biscuit, access_token):
         "accept": "application/json",
         "content-type": "application/json",
         "authorization": f"Bearer {access_token}", 
-        "biscuit": biscuit['token']
+        "biscuit": biscuit['token'] # needed for staging env. idk why.  
     }
     
     try:
-        resp = requests.post(url, json=payload, headers=headers) 
+        resp = requests.post(url, json=payload, headers=headers)
+        resp.raise_for_status() 
     except requests.exceptions.RequestException as e:
         # if we don't get valid json response from the API
         logging.error(f"Table creation: {resp.status_code}\nSxT API Response text: {resp.text}")
-        return False
-   
+        sys.exit()
+        
     logging.info(f"Table {biscuit['resource_id']} created successfully with API response code : {resp.status_code}")
     return True
 
@@ -59,8 +64,11 @@ def create_tamperproof_table(biscuit, access_token):
 def insert_data(biscuit, access_token):
     # https://docs.spaceandtime.io/reference/modify-data-dml
     url = conf['api_url'] + "sql/dml"
-    
-    sqlText = f"INSERT INTO {biscuit['resource_id']} (ID, PROOF_ORDER, PLANET) VALUES (0, 0, 'VENUS')"
+    planet = random_planet()    
+    # manual auto increment - We could get MAX PROOF_ORDER +1 via SxT query instead of hardcoding 0 here
+
+    # add a row to the tamperproof table
+    sqlText = f"INSERT INTO {biscuit['resource_id']} (PROOF_ORDER, PLANET) VALUES (0, '{planet}');"
 
     payload = {
         "resources": [biscuit['resource_id']],
@@ -76,13 +84,14 @@ def insert_data(biscuit, access_token):
 
     try:
         resp = requests.post(url, json=payload, headers=headers)
-        logging.info(f"Inserted data '0,0,VENUS' into tamper proof table successfully with response code : {resp.status_code} - Please wait 10 seconds for the data to be persisted...")
+        resp.raise_for_status() 
+        logging.info(f"Inserted data '0', {planet} into tamper proof table successfully with response code : {resp.status_code} - Please wait 10 seconds for the data to be persisted...")
         _ = [time.sleep(1) for _ in range(11)] # wait 10 seconds for the data to be persisted
         return True
     except requests.exceptions.RequestException as e:
         logging.error(f"Insert data failed with : {resp.status_code} and error : {resp.text}")
-        return False
-    
+        sys.exit()
+
 # Query a tamperproof table
 def query_tamperproof_table(biscuit, access_token):
 
@@ -102,12 +111,13 @@ def query_tamperproof_table(biscuit, access_token):
 
     try:
         resp = requests.post(url, json=payload, headers=headers)
+        resp.raise_for_status() 
         logging.info(f"Query tamperproof table successfully with code : {resp.status_code}")
         logging.info(f"SxT query response data: {deserialize_batch(resp.content)}")
         return True
     except requests.exceptions.RequestException as e:
         logging.error(f"Query tamperproof table failed with : {resp.status_code} and error : {resp.text}")
-        return False
+        sys.exit()
     
 # process Arrow IPC binary response
 def deserialize_batch(serialized_batch):
@@ -254,6 +264,13 @@ def authenticate():
     logging.debug(f'Authenticaiton to the SxT API has been completed successfully!\n Access token: {access_token}\n Refresh token: {refresh_token}')
     
     return access_token
+
+def random_planet():
+    # List of planets' names
+    planets = ['Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune']
+
+    # Randomly pick a planet name
+    return random.choice(planets)
 
 def load_env():
     try:
